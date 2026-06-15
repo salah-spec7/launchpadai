@@ -194,7 +194,7 @@ class SecureTokenStore {
       let encrypted = cipher.update(plaintext, 'utf8', 'hex');
       encrypted += cipher.final('hex');
       
-      const authTag = cipher.getAuthTag();
+      const authTag = (cipher as any).getAuthTag();
       const payload = {
         iv: iv.toString('hex'),
         data: encrypted,
@@ -222,7 +222,7 @@ class SecureTokenStore {
         this.encryptionKey,
         Buffer.from(payload.iv, 'hex')
       ) as any;
-      decipher.setAuthTag(Buffer.from(payload.authTag, 'hex'));
+      (decipher as any).setAuthTag(Buffer.from(payload.authTag, 'hex'));
 
       let decrypted = decipher.update(payload.data, 'hex', 'utf8');
       decrypted += decipher.final('utf8');
@@ -584,7 +584,7 @@ Requirements: ${(job.requiredSkills || []).map((s: string) => sanitizeAIInput(s,
 [SAFE BOUNDARY END]
 
 Return JSON:
-{ "overallVerdict": "passed|failed|needs_review", "technicalFit": "high|medium|low", "compatibilityScore": 0-100, "strengths": [], "gaps": [], "interviewFocus": [], "talkingPoints": [], "recommendation": "" }
+{ "overallVerdict": "passed|failed|needs_review", "technicalFit": "high|medium|low", "compatibilityScore": 0-100, "strengths": [], "gaps": [], "interviewFocus": [], "talkingPoints": [], "recommen[...]
 `;
 
         const response = await ai.models.generateContent({
