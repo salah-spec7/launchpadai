@@ -1,8 +1,98 @@
+# Dependencies
 node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build outputs
 build/
 dist/
 coverage/
+*.tsbuildinfo
+.next/
+out/
+
+# Environment variables (CRITICAL)
+.env
+.env.local
+.env.*.local
+.env.*.private
+.env.production.local
+.env.test.local
+.env.development.local
+
+# Runtime & persistent data
+.data/
+.cache/
+.session/
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup & temporary files
+*.bak
+*.backup
+*.tmp
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+
+# Logs
 *.log
-.env*
-!.env.example
+*.log.gz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+pnpm-debug.log*
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-*
+*.sublime-project
+*.sublime-workspace
+.vs/
+.vscode-test
+.history/
+*.swp
+*.swo
+*~
+
+# OS
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+._*
+
+# Testing
+.coverage
+.nyc_output
+jest.config.js
+
+# Sensitive/Private files
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+.ssh/
+.private/
+secrets/
+credentials.json
+
+# Build artifacts
+node_modules/.cache
+*.tgz
+
+# Development tools
+.env.local.vault
+.direnv
+.envrc
+
+# AI/LLM session artifacts
+.copilot-session
+.agent-logs
