@@ -1,0 +1,172 @@
+# ============================================================
+# LaunchPad AI — Antigravity Agent Orchestration Configuration
+# Defines two parallel server-side background sub-agents
+# ============================================================
+
+version: "1.0"
+name: "launchpad-ai-orchestrator"
+runtime: "express-ts"
+server_entry: "server.ts"
+
+agents:
+  # ─────────────────────────────────────────────────────
+  # Agent 1: AI Vetting Agent
+  # ─────────────────────────────────────────────────────
+  - id: "vetting-agent"
+    name: "AI Vetting Agent"
+    endpoint: "/api/matches/vetting"
+    method: "POST"
+    trigger: "match_event:double_right_swipe"
+    async: true
+    model: "gemini-3.5-flash"
+    fallback: "heuristic_local"
+    timeout_ms: 15000
+
+    input_schema:
+      student:
+        type: "StudentProfile"
+        source: "presets | parsed_resume_text"
+        required_fields:
+          - fullName
+          - skills
+          - university
+          - major
+          - aiSummary
+      job:
+        type: "Job"
+        required_fields:
+          - companyName
+          - title
+          - requiredSkills
+          - description
+          - requirements
+
+    output_schema:
+      type: "VettingReport"
+      fields:
+        overallVerdict:
+          type: "enum"
+          values: ["passed", "failed", "needs_review"]
+        technicalFit:
+          type: "enum"
+          values: ["high", "medium", "low"]
+        compatibilityScore:
+          type: "integer"
+          range: [0, 100]
+          maps_to: "compatibilityRating"
+        strengths:
+          type: "string[]"
+          min_items: 3
+          description: "3-bullet array highlighting technical developer fit"
+        gaps:
+          type: "string[]"
+        interviewFocus:
+          type: "string[]"
+        talkingPoints:
+          type: "string[]"
+          min_items: 2
+          description: "2 hyper-personalized technical conversation starters"
+          maps_to: "icebreakers"
+        recommendation:
+          type: "string"
+
+    structural_analysis:
+      github_signals:
+        - publicRepos
+        - followers
+        - stars
+        - "languages (weighted distribution)"
+      resume_signals:
+        - "skills overlap ratio"
+        - "university tier mapping"
+        - "graduation proximity"
+
+  # ─────────────────────────────────────────────────────
+  # Agent 2: Meet Schedule Agent
+  # ─────────────────────────────────────────────────────
+  - id: "schedule-agent"
+    name: "Meet Schedule Agent"
+    endpoint: "/api/meetings/schedule"
+    method: "POST"
+    trigger: "vetting_agent:completed"
+    async: true
+    depends_on: "vetting-agent"
+    timeout_ms: 10000
+
+    google_workspace:
+      api: "calendar.v3"
+      scopes:
+        - "https://www.googleapis.com/auth/calendar.events"
+      conference_solution: "hangoutsMeet"
+      oauth_flow: "authorization_code"
+      callback_uri: "/auth/google/callback"
+
+    input_schema:
+      studentName:
+        type: "string"
+      recruiterName:
+        type: "string"
+      companyName:
+        type: "string"
+      jobTitle:
+        type: "string"
+      customDate:
+        type: "string"
+        format: "YYYY-MM-DD"
+      customTime:
+        type: "string"
+        format: "HH:mm"
+      durationMinutes:
+        type: "integer"
+        default: 30
+        enum: [15, 30, 45, 60]
+      agendaOverride:
+        type: "string"
+      studentEmail:
+        type: "string"
+        format: "email"
+      recruiterEmail:
+        type: "string"
+        format: "email"
+
+    output_schema:
+      success:
+        type: "boolean"
+      scheduledAt:
+        type: "string"
+        format: "ISO 8601"
+      googleMeetLink:
+        type: "string"
+        format: "url"
+        description: "Live authenticated Meet link (replaces static abc-defg-hij)"
+      durationMinutes:
+        type: "integer"
+      googleCalendarEventId:
+        type: "string"
+      agenda:
+        type: "string"
+
+    session_commit:
+      target: "runtime_session_object"
+      fields:
+        - googleCalendarEventId
+        - googleMeetLink
+        - scheduledAt
+        - status
+
+orchestration:
+  pipeline: "sequential_with_parallel_fallback"
+  flow:
+    1:
+      agent: "vetting-agent"
+      on_success: "continue"
+      on_failure: "fallback_heuristic"
+    2:
+      agent: "schedule-agent"
+      on_success: "commit_session"
+      on_failure: "return_simulated_link"
+
+  session:
+    store: "in-memory-map"
+    ttl_minutes: 60
+    keys: ["userId", "matchId"]

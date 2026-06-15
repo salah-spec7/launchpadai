@@ -1,0 +1,784 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import express from 'express';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI, Type } from '@google/genai';
+import dotenv from 'dotenv';
+import multer from 'multer';
+import mammoth from 'mammoth';
+import { createRequire } from 'module';
+import { google } from 'googleapis';
+
+const require = createRequire(import.meta.url);
+const pdf = require('pdf-parse');
+
+/**
+ * Basic sanitization for user inputs used in AI prompts
+ * to mitigate prompt injection.
+ */
+const sanitizeAIInput = (text: string | undefined): string => {
+  if (!text) return '';
+  // Remove potential prompt injection markers and excessive whitespace
+  return text
+    .replace(/[<>]/g, '') // Remove brackets often used for tags
+    .replace(/(\r\n|\n|\r)/gm, ' ') // Flatten to single line
+    .replace(/\s+/g, ' ') // Collapse spaces
+    .trim()
+    .slice(0, 2000); // Reasonable limit for input snippets
+};
+
+// Load environment variables
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+
+// Use Helmet for security headers
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      "img-src": ["'self'", "data:", "https://*"],
+      "connect-src": ["'self'", "https://*.googleapis.com", "https://*.google.com"],
+      "script-src": ["'self'", "'unsafe-inline'"], // Note: Adjust if production requires stricter CSP
+    },
+  },
+}));
+
+app.use(express.json());
+const PORT = 3000;
+
+// Global rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+// Apply rate limiter to all routes
+app.use(limiter);
+
+// Specific rate limiter for AI and file upload endpoints
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30, // Stricter limit for heavy endpoints
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'API usage limit reached, please try again later.' },
+});
+
+// Initialize Google Gemini Client securely
+let ai: GoogleGenAI | null = null;
+const API_KEY = process.env.GEMINI_API_KEY;
+
+if (API_KEY && API_KEY !== 'MY_GEMINI_API_KEY') {
+  try {
+    ai = new GoogleGenAI({
+      apiKey: API_KEY,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+    console.log('Gemini API successfully initialized on the server side!');
+  } catch (error) {
+    console.error('Failed to initialize GoogleGenAI SDK client:', error);
+  }
+} else {
+  console.log('Gemini API key is unconfigured or a placeholder. Running AI module in simulated/hybrid backup mode.');
+}
+
+// ============================================
+// GOOGLE OAUTH 2.0 CONFIGURATION
+// ============================================
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/auth/google/callback';
+const CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.events'];
+
+// In-memory token store keyed by session identifier
+const oauthTokenStore = new Map<string, any>();
+
+// In-memory state store for OAuth CSRF protection
+const oauthStateStore = new Map<string, string>();
+
+// In-memory meeting session store for committed appointment data
+const meetingSessionStore = new Map<string, any>();
+
+let oauth2Client: InstanceType<typeof google.auth.OAuth2> | null = null;
+if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET
+    && GOOGLE_CLIENT_ID !== 'MY_GOOGLE_CLIENT_ID') {
+  oauth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URI
+  );
+  console.log('Google OAuth2 client initialized for Calendar + Meet integration.');
+} else {
+  console.log('Google OAuth credentials not configured. Meet scheduling will use simulated links.');
+}
+
+// ============================================
+// API ENDPOINTS
+// ============================================
+
+/**
+ * Health check endpoint
+ */
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    environment: process.env.NODE_ENV || 'development',
+    aiEngineActive: ai !== null,
+  });
+});
+
+// Configure Multer for processing file uploads in memory
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB file limit
+  }
+});
+
+/**
+ * Endpoint to parse uploaded resumes (.pdf, .docx, .txt, .md) 
+ * and return extracted plain text.
+ */
+app.post('/api/profiles/upload-resume', apiLimiter, upload.single('resume'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file was uploaded.' });
+    }
+
+    const { originalname, buffer, mimetype } = req.file;
+    const extension = path.extname(originalname).toLowerCase();
+    let extractedText = '';
+
+    console.log(`Extracting text from uploaded resume: ${originalname} (${mimetype})`);
+
+    if (extension === '.pdf' || mimetype === 'application/pdf') {
+      try {
+        const data = await pdf(buffer);
+        extractedText = data.text || '';
+      } catch (pdfErr) {
+        console.error('Error parsing PDF content:', pdfErr);
+        return res.status(422).json({ 
+          error: 'Failed to process PDF. Please check if the file is encrypted or password-protected.' 
+        });
+      }
+    } else if (
+      extension === '.docx' || 
+      mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ) {
+      try {
+        const result = await mammoth.extractRawText({ buffer });
+        extractedText = result.value || '';
+      } catch (docxErr) {
+        console.error('Error parsing Word document:', docxErr);
+        return res.status(422).json({ 
+          error: 'Failed to process DOCX file. Ensure it is a valid, uncorrupted Word document.' 
+        });
+      }
+    } else if (extension === '.txt' || extension === '.md' || mimetype.startsWith('text/')) {
+      extractedText = buffer.toString('utf-8');
+    } else {
+      return res.status(400).json({ 
+        error: `File format ${extension || mimetype} is unsupported. Please upload a PDF, DOCX, or plain text file.` 
+      });
+    }
+
+    const sanitizedText = extractedText.trim();
+    if (!sanitizedText) {
+      return res.status(422).json({ 
+        error: 'The uploaded file was parsed successfully, but no readable text could be extracted.' 
+      });
+    }
+
+    console.log(`Successfully extracted ${sanitizedText.length} characters from ${originalname}`);
+
+    return res.json({
+      success: true,
+      text: sanitizedText,
+      fileName: originalname,
+      message: `Extracted resume profiles successfully from ${originalname}`
+    });
+
+  } catch (err: any) {
+    console.error('General resume parsed error (log context only):', err.message);
+    return res.status(500).json({ 
+      error: 'An unexpected error occurred during resume digestion. Please try again.' 
+    });
+  }
+});
+
+/**
+ * 1. Hydrate User Profile from GitHub / LinkedIn Inputs
+ */
+app.post('/api/profiles/hydrate', apiLimiter, async (req, res) => {
+  const { username, rawSnippet, mode } = req.body;
+
+  if (!username && !rawSnippet) {
+    return res.status(400).json({ error: 'Username or direct text payload is required for profile development.' });
+  }
+
+  // Set up fallback simulation data based on credentials
+  const defaultSkills = ['React', 'Next.js', 'TypeScript', 'Node.js', 'Tailwind CSS', 'PostgreSQL', 'Docker', 'Git'];
+  const defaultTags = ['Fast Learner', 'Full-Stack Developer', 'Product Designer', 'Team Player'];
+  const defaultHeadline = username 
+    ? `Software Engineer & Open-Source Builder | @${username}`
+    : 'Creative Full-Stack Software Engineer';
+  const defaultSummary = 'Active developer passionate about UI craft and state management. Specialized in dynamic components and multi-threaded service connections.';
+
+  // If Gemini is active, let's call the model!
+  if (ai) {
+    try {
+      const safeUsername = sanitizeAIInput(username as string);
+      const safeSnippet = sanitizeAIInput(rawSnippet as string);
+      const safeMode = sanitizeAIInput(mode as string);
+
+      console.log(`Analyzing developer signals for user: ${safeUsername || 'rawText_snippet'}`);
+      const prompt = `
+You are an expert technical recruiter, talent analyst, and software architect.
+Analyze the following developer indicators and output a professional profile summary structure.
+
+[STRICT BOUNDARY START]
+Input Data:
+- GitHub/Username: ${safeUsername || 'Unspecified'}
+- Raw Info Snippet: ${safeSnippet || 'None'}
+- Profiling Category: ${safeMode || 'student'}
+[STRICT BOUNDARY END]
+
+Return a JSON payload matching the following schema structure:
+{
+  "summary": "2-3 sentences of inspiring professional summary focusing on side projects, technical passion, and craftsmanship",
+  "skills": ["Array of actual developer technologies that match, max 8 items"],
+  "personalityTags": ["3-4 snappy visual descriptive personality chips, e.g. Open-Source Dev, Accessibility Champion, performance focused"],
+  "headline": "A highly catchy professional headline tailored to attract tech recruiters. Max 50 chars.",
+  "simulatedStats": {
+    "publicRepos": 18,
+    "followers": 41,
+    "stars": 67
+  }
+}
+
+Use simple technical vocabulary and keep formatting very professional. Make sure to return valid parsed JSON with no surround formatting besides the JSON string itself.
+`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              summary: { type: Type.STRING },
+              skills: { 
+                type: Type.ARRAY, 
+                items: { type: Type.STRING } 
+              },
+              personalityTags: { 
+                type: Type.ARRAY, 
+                items: { type: Type.STRING } 
+              },
+              headline: { type: Type.STRING },
+              simulatedStats: {
+                type: Type.OBJECT,
+                properties: {
+                  publicRepos: { type: Type.INTEGER },
+                  followers: { type: Type.INTEGER },
+                  stars: { type: Type.INTEGER }
+                },
+              }
+            },
+            required: ['summary', 'skills', 'personalityTags', 'headline']
+          }
+        }
+      });
+
+      const parsedResponse = JSON.parse(response.text?.trim() || '{}');
+      return res.json({
+        success: true,
+        aiHydrated: true,
+        data: {
+          headline: parsedResponse.headline || defaultHeadline,
+          aiSummary: parsedResponse.summary || defaultSummary,
+          skills: parsedResponse.skills || defaultSkills,
+          personalityTags: parsedResponse.personalityTags || defaultTags,
+          githubStats: parsedResponse.simulatedStats || { publicRepos: 21, followers: 32, stars: 45 }
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Error in agentic profiling execution (log context only):', error.message);
+      // Fall back gracefully below
+    }
+  }
+
+  // Graceful simulation path if Gemini API client is not initialized or failed
+  console.log('Returning high-fidelity simulated hydration context.');
+  
+  // Customization of simulation by parsing keywords
+  const customSkills = [...defaultSkills];
+  const combinedText = `${username} ${rawSnippet}`.toLowerCase();
+  
+  if (combinedText.includes('rust') || combinedText.includes('systems')) {
+    customSkills.unshift('Rust', 'WebAssembly');
+  }
+  if (combinedText.includes('python') || combinedText.includes('ai') || combinedText.includes('ml')) {
+    customSkills.unshift('Python', 'PyTorch', 'FastAPI');
+  }
+  if (combinedText.includes('cloud') || combinedText.includes('docker') || combinedText.includes('kubernetes')) {
+    customSkills.unshift('Go', 'Docker', 'Kubernetes', 'AWS');
+  }
+
+  const simulatedStats = {
+    publicRepos: Math.floor(Math.random() * 20) + 10,
+    followers: Math.floor(Math.random() * 80) + 15,
+    stars: Math.floor(Math.random() * 150) + 10
+  };
+
+  return res.json({
+    success: true,
+    aiHydrated: false,
+    data: {
+      headline: username ? `Software Engineer @ ${username.toUpperCase()} Tech` : defaultHeadline,
+      aiSummary: `Passionate engineer specializing in modern software development paradigms. Successfully implemented full-stack solutions and automation pipelines with emphasis on performance. (Heuristic hydrated based on: ${username || 'Resume Input'})`,
+      skills: customSkills.slice(0, 8),
+      personalityTags: ['Algorithmic thinker', 'Analytical', 'Pragmatic Coder', 'Git Wizard'],
+      githubStats: simulatedStats
+    }
+  });
+});
+
+/**
+ * 2. Smart Vetting Agent (Post-Match review)
+ */
+app.post('/api/matches/vetting', apiLimiter, async (req, res) => {
+  const { student, job } = req.body;
+
+  if (!student || !job) {
+    return res.status(400).json({ error: 'Student and Job profiles are required to conduct vetting analysis.' });
+  }
+
+  if (ai) {
+    try {
+      const safeStudentName = sanitizeAIInput(student.fullName);
+      const safeCompanyName = sanitizeAIInput(job.companyName);
+
+      console.log(`Conducting AI Vetting Review for ${safeStudentName} at ${safeCompanyName}`);
+      
+      const prompt = `
+You are the AI Vetting Agent at LaunchPad AI. Conduct an algorithmic vetting review based on the following criteria:
+
+[DATA BOUNDARY START]
+STUDENT PROFILE:
+- Full Name: ${sanitizeAIInput(student.fullName)}
+- Headline: ${sanitizeAIInput(student.headline)}
+- Skills: ${student.skills?.map((s: any) => sanitizeAIInput(s)).join(', ')}
+- University: ${sanitizeAIInput(student.university)} (Major: ${sanitizeAIInput(student.major)})
+- Biography Details: ${sanitizeAIInput(student.aiSummary)}
+
+JOB SPECS:
+- Company: ${sanitizeAIInput(job.companyName)}
+- Job Title: ${sanitizeAIInput(job.title)}
+- Focus Stack: ${job.requiredSkills?.map((s: any) => sanitizeAIInput(s)).join(', ')}
+- Core Description: ${sanitizeAIInput(job.description)}
+- Key Requirements: ${job.requirements?.map((r: any) => sanitizeAIInput(r)).join(' | ')}
+[DATA BOUNDARY END]
+
+Formulate a complete Vetting Analysis in JSON format matching this schema exactly:
+{
+  "overallVerdict": "passed", // can be "passed", "failed", or "needs_review"
+  "technicalFit": "high", // can be "high", "medium", or "low"
+  "compatibilityScore": 88, // integer between 0 and 100
+  "strengths": ["list at least 3 concrete alignment reasons"],
+  "gaps": ["list 1-2 minor missing areas / training suggestions"],
+  "interviewFocus": ["2 structured interview topics or practical code test areas"],
+  "talkingPoints": ["2 great conversation starter hooks derived directly from their bio/portfolio for recruiters"],
+  "recommendation": "A short verbal recommendation (1-2 sentences) about scheduling next steps"
+}
+
+Be constructive, specific, and realistic based on university fresher positions. Ensure valid JSON return.
+`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              overallVerdict: { type: Type.STRING },
+              technicalFit: { type: Type.STRING },
+              compatibilityScore: { type: Type.INTEGER },
+              strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+              gaps: { type: Type.ARRAY, items: { type: Type.STRING } },
+              interviewFocus: { type: Type.ARRAY, items: { type: Type.STRING } },
+              talkingPoints: { type: Type.ARRAY, items: { type: Type.STRING } },
+              recommendation: { type: Type.STRING }
+            },
+            required: [
+              'overallVerdict', 
+              'technicalFit', 
+              'compatibilityScore', 
+              'strengths', 
+              'gaps', 
+              'interviewFocus', 
+              'talkingPoints', 
+              'recommendation'
+            ]
+          }
+        }
+      });
+
+      const vettingReport = JSON.parse(response.text?.trim() || '{}');
+      return res.json({
+        success: true,
+        aiProcessed: true,
+        report: vettingReport
+      });
+
+    } catch (error: any) {
+      console.error('Error conducting AI vetting operation (log context only):', error.message);
+      // fallback handled below
+    }
+  }
+
+  // Graceful Local Vetting Analytics Simulation
+  console.log('Generating logical local heuristic matching report...');
+  const studentSkills = new Set((student.skills || []).map((s: string) => s.toLowerCase()));
+  const requiredSkills = (job.requiredSkills || []).map((s: string) => s.toLowerCase());
+  
+  let overlapCount = 0;
+  requiredSkills.forEach((skill: string) => {
+    if (studentSkills.has(skill)) overlapCount++;
+  });
+
+  const matchingPercentage = Math.min(65 + (overlapCount * 8), 98) + Math.floor(Math.random() * 5);
+  const technicalFit = matchingPercentage >= 85 ? 'high' : matchingPercentage >= 70 ? 'medium' : 'low';
+  
+  const simulatedReport = {
+    overallVerdict: matchingPercentage >= 75 ? 'passed' : 'needs_review',
+    technicalFit: technicalFit,
+    compatibilityScore: matchingPercentage,
+    strengths: [
+      `Active matching overlap on key core skills: ${overlapCount} technologies found.`,
+      `Passionate engineering background from ${student.university || 'academic institution'}.`,
+      'Demonstrated portfolio signal alignment matching job scope.'
+    ],
+    gaps: [
+      'Further practical validation of team workflow orchestration is suggested.'
+    ],
+    interviewFocus: [
+      'Refining modular class design workflows and state rendering.',
+      'Analyzing communication structure.'
+    ],
+    talkingPoints: [
+      `Explain the inspiration behind your projects and how you tackled ${overlapCount > 0 ? Array.from(studentSkills)[0] : 'core engineering'} scaling limits.`,
+      `Inquire about ${job.companyName}'s product development cycle.`
+    ],
+    recommendation: `Candidate matches key metrics with a ${matchingPercentage}% compatibility indicator. Recommend scheduling full-loop review.`
+  };
+
+  return res.json({
+    success: true,
+    aiProcessed: false,
+    report: simulatedReport
+  });
+});
+
+// ============================================
+// GOOGLE OAUTH FLOW ENDPOINTS
+// ============================================
+
+/**
+ * GET /auth/google — Redirect user to Google consent screen
+ */
+app.get('/auth/google', (req, res) => {
+  if (!oauth2Client) {
+    return res.status(503).json({
+      error: 'Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env'
+    });
+  }
+
+  const userId = (req.query.userId as string) || 'default-user';
+  // Generate a cryptographically secure random state for CSRF protection
+  const state = crypto.randomBytes(32).toString('hex');
+  oauthStateStore.set(state, userId);
+
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: CALENDAR_SCOPES,
+    prompt: 'consent',
+    state: state
+  });
+  res.redirect(authUrl);
+});
+
+/**
+ * GET /auth/google/callback — Handle OAuth redirect and store tokens
+ */
+app.get('/auth/google/callback', async (req, res) => {
+  if (!oauth2Client) {
+    return res.status(503).json({ error: 'OAuth client not initialized.' });
+  }
+
+  const code = req.query.code as string;
+  const state = req.query.state as string;
+
+  // Validate state for CSRF protection
+  const userId = oauthStateStore.get(state);
+  if (!userId) {
+    console.error('OAuth state mismatch or expired. Potential CSRF attempt.');
+    return res.status(403).json({ error: 'Invalid OAuth state. Please try again.' });
+  }
+
+  // Clean up state after use
+  oauthStateStore.delete(state);
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauthTokenStore.set(userId, tokens);
+    oauth2Client.setCredentials(tokens);
+    console.log(`OAuth tokens stored for user: ${userId}`);
+
+    // Redirect back to app with success indicator
+    const appUrl = process.env.APP_URL || 'http://localhost:3000';
+    res.redirect(`${appUrl}?oauth=success`);
+  } catch (error: any) {
+    console.error('OAuth callback error:', error);
+    res.status(500).json({ error: `OAuth token exchange failed: ${error.message}` });
+  }
+});
+
+/**
+ * GET /auth/google/status — Check if a user has valid OAuth tokens
+ */
+app.get('/auth/google/status', (req, res) => {
+  const userId = (req.query.userId as string) || 'default-user';
+  const hasTokens = oauthTokenStore.has(userId);
+  res.json({
+    authenticated: hasTokens,
+    provider: 'google',
+    scopes: hasTokens ? CALENDAR_SCOPES : []
+  });
+});
+
+/**
+ * 3. Schedule Workspace Meeting Code — Dual-Mode Google Meet Event Generator
+ *
+ * LIVE MODE: When valid OAuth tokens exist, creates a real Google Calendar event
+ *   with conferenceData.createRequest to provision a genuine hangoutsMeet link.
+ * SIMULATION MODE: Falls back to randomized code generation when OAuth is
+ *   unconfigured (preserving current demo behavior).
+ */
+app.post('/api/meetings/schedule', async (req, res) => {
+  const {
+    studentName,
+    recruiterName,
+    companyName,
+    jobTitle,
+    indexShiftDays,
+    customDate,
+    customTime,
+    customMeetCode,
+    durationMinutes,
+    agendaOverride,
+    studentEmail,
+    recruiterEmail,
+    userId
+  } = req.body;
+
+  const duration = Number(durationMinutes) || 30;
+  const agenda = agendaOverride ||
+    `LaunchPad Match: Kickoff meeting between ${studentName} and ${recruiterName} (${companyName}) for role '${jobTitle}'.`;
+
+  // Calculate scheduled datetime
+  let scheduledDate = new Date();
+  if (customDate) {
+    const rawTimePart = customTime || '10:00';
+    scheduledDate = new Date(`${customDate}T${rawTimePart}:00`);
+    if (isNaN(scheduledDate.getTime())) {
+      scheduledDate = new Date();
+    }
+  } else {
+    const daysAhead = indexShiftDays || 2;
+    scheduledDate.setDate(scheduledDate.getDate() + daysAhead);
+    scheduledDate.setHours(10, 0, 0, 0);
+  }
+
+  const endDate = new Date(scheduledDate.getTime() + duration * 60 * 1000);
+
+  // ── LIVE GOOGLE CALENDAR MODE ──
+  const sessionUserId = userId || 'default-user';
+  const storedTokens = oauthTokenStore.get(sessionUserId);
+
+  if (oauth2Client && storedTokens) {
+    try {
+      const authedClient = new google.auth.OAuth2(
+        GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
+      );
+      authedClient.setCredentials(storedTokens);
+
+      // Refresh token if expired
+      if (storedTokens.expiry_date && storedTokens.expiry_date < Date.now()) {
+        const { credentials } = await authedClient.refreshAccessToken();
+        oauthTokenStore.set(sessionUserId, credentials);
+        authedClient.setCredentials(credentials);
+      }
+
+      const calendar = google.calendar({ version: 'v3', auth: authedClient });
+
+      const attendees: Array<{ email: string }> = [];
+      if (studentEmail) attendees.push({ email: studentEmail });
+      if (recruiterEmail) attendees.push({ email: recruiterEmail });
+
+      const eventPayload = {
+        summary: `LaunchPad AI Interview: ${companyName} (${jobTitle})`,
+        description:
+          `\u{1F680} LaunchPad AI Match!\n\n` +
+          `Candidate: ${studentName}\nCompany: ${companyName}\nRole: ${jobTitle}\n\n` +
+          `Agenda: ${agenda}\n\nThis meeting was auto-scheduled by LaunchPad AI's Meet Schedule Agent.`,
+        start: { dateTime: scheduledDate.toISOString(), timeZone: 'UTC' },
+        end: { dateTime: endDate.toISOString(), timeZone: 'UTC' },
+        attendees,
+        conferenceData: {
+          createRequest: {
+            requestId: `lp-meet-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            conferenceSolutionKey: { type: 'hangoutsMeet' }
+          }
+        }
+      };
+
+      const response = await calendar.events.insert({
+        calendarId: 'primary',
+        requestBody: eventPayload,
+        conferenceDataVersion: 1,
+      });
+
+      const meetLink = response.data.hangoutLink ||
+        response.data.conferenceData?.entryPoints?.[0]?.uri ||
+        `https://meet.google.com/${response.data.id}`;
+
+      // Commit finalized appointment data to runtime session store
+      const sessionRecord = {
+        googleCalendarEventId: response.data.id,
+        googleMeetLink: meetLink,
+        scheduledAt: scheduledDate.toISOString(),
+        status: 'confirmed',
+        durationMinutes: duration,
+        agenda,
+        liveIntegration: true,
+        committedAt: new Date().toISOString()
+      };
+      meetingSessionStore.set(`meeting-${response.data.id}`, sessionRecord);
+
+      console.log(`\u2705 Live Google Calendar event created: ${response.data.id}`);
+
+      return res.json({
+        success: true,
+        liveIntegration: true,
+        scheduledAt: scheduledDate.toISOString(),
+        googleMeetLink: meetLink,
+        durationMinutes: duration,
+        googleCalendarEventId: response.data.id,
+        agenda,
+        calendarStatus: response.data.status
+      });
+    } catch (error: any) {
+      console.error('Google Calendar API error, falling back to simulation:', error.message);
+      // Fall through to simulation mode below
+    }
+  }
+
+  // ── SIMULATION FALLBACK MODE ──
+  // Preserved existing behavior for demos without OAuth
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const selectRandom = (len: number) => {
+    let resStr = '';
+    for (let i = 0; i < len; i++) {
+      resStr += letters[Math.floor(Math.random() * letters.length)];
+    }
+    return resStr;
+  };
+
+  const randomCode = `${selectRandom(3)}-${selectRandom(4)}-${selectRandom(3)}`;
+  const meetCode = customMeetCode ? customMeetCode.trim() : randomCode;
+
+  let meetLink = meetCode;
+  if (!meetLink.includes('.') && !meetLink.startsWith('http://') && !meetLink.startsWith('https://')) {
+    meetLink = `https://meet.google.com/${meetCode}`;
+  } else if (!meetLink.startsWith('http://') && !meetLink.startsWith('https://')) {
+    meetLink = `https://${meetLink}`;
+  }
+
+  // Commit simulated appointment data to runtime session store
+  const simEventId = `lp-event-${Math.floor(Math.random() * 100000)}-${meetCode.replace(/[^a-zA-Z0-9-]/g, '')}`;
+  meetingSessionStore.set(`meeting-${simEventId}`, {
+    googleCalendarEventId: simEventId,
+    googleMeetLink: meetLink,
+    scheduledAt: scheduledDate.toISOString(),
+    status: 'confirmed',
+    durationMinutes: duration,
+    agenda,
+    liveIntegration: false,
+    committedAt: new Date().toISOString()
+  });
+
+  return res.json({
+    success: true,
+    liveIntegration: false,
+    scheduledAt: scheduledDate.toISOString(),
+    googleMeetLink: meetLink,
+    durationMinutes: duration,
+    googleCalendarEventId: simEventId,
+    agenda
+  });
+});
+
+// ============================================
+// SERVER ASSETS & VITE MIDDLEWARE SETUP
+// ============================================
+
+const startServer = async () => {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+    console.log('Vite middleware successfully mounted for Express in development!');
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+    console.log('Serving production compiled client-side app from /dist.');
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`LaunchPad AI Dev & API server is listening at http://0.0.0.0:${PORT}`);
+  });
+};
+
+startServer().catch((err) => {
+  console.error('Fatal dev server compilation abort:', err);
+});

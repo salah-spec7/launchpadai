@@ -1,0 +1,6 @@
+{
+  "name": "LaunchPad AI",
+  "description": "Tinder-for-Jobs swipeable matching platform for college students and recruiters with automated AI vetting and Google Meet scheduling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
