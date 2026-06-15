@@ -4,7 +4,6 @@
     "module": "ESNext",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     
-    // Strict type checking
     "strict": true,
     "noImplicitAny": true,
     "noImplicitThis": true,
@@ -16,13 +15,11 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     
-    // Module resolution
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     
-    // Best practices
     "skipLibCheck": false,
     "isolatedModules": true,
     "moduleDetection": "force",
@@ -32,17 +29,14 @@
     "noUnusedParameters": true,
     "allowImportingTsExtensions": false,
     
-    // Output
     "jsx": "react-jsx",
     "noEmit": true,
     "sourceMap": true,
     
-    // Paths
     "paths": {
       "@/*": ["./*"]
     },
     
-    // Decorators (if needed)
     "experimentalDecorators": true,
     "useDefineForClassFields": true
   },
